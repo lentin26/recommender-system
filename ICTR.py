@@ -1,189 +1,193 @@
-from ICTRbase import ICTRbase
+import copy
 from numpy import argmax, ones, zeros, identity, matmul, sqrt
 from numpy.linalg import inv
-from numpy.random import dirichlet, multivariate_normal, multinomial, normal
-from scipy.stats import invgamma, multivariate_normal
+from numpy.random import dirichlet, multivariate_normal, multinomial, choice
+from scipy.stats import invgamma, norm, multivariate_normal
 import numpy as np
+# from tqdm import tqdm
 
 
-class ICTR:
+class Particle:
+    """
+    A particle is a container that maintains the current status information for both user m and item x_{m,t}
+    """
+    def __init__(self, n_users: int, n_items: int, n_lat: int):
+        # number of users, items, and latent dimensions
+        self.n_users = n_users
+        self.n_items = n_items
+        self.n_lat = n_lat
+        # dirichlet hyperparameter, preference component for users
+        self.lambda_p = ones(n_lat)
+        self.eta = ones((n_lat, n_items))
+        self.Phi = ones((n_lat, n_items))
+        # variance inverse gaussian hyper-parameters
+        self.alpha = 1
+        self.beta = 1
+        # mean, variance, covariance for items
+        self.mu_q = zeros((n_items, n_lat))
+        self.sigma_sq = invgamma(self.alpha, self.beta).rvs()
+        self.cov = [identity(self.n_lat)] * self.n_items
+        # user (p) and item vectors (q)
+        self.p = dirichlet(self.lambda_p, size=self.n_users)
+        self.q = multivariate_normal([0]*self.n_lat, identity(self.n_lat)).rvs(size=self.n_items)
+
+    def p_expectation(self, topic=None, reward=None):
+        computed_sum = np.sum(self.lambda_p)
+        user_lambda = np.copy(self.lambda_p)
+        if reward is not None:
+            user_lambda[topic] += reward
+            computed_sum += reward
+        return user_lambda / computed_sum
+
+    def phi_expectation(self, item_id, reward=None):
+        computed_sum = np.sum(self.eta, axis=1)
+        item_eta = np.copy(self.eta[:, item_id])
+        if reward is not None:
+            item_eta += reward
+            computed_sum += reward
+        return item_eta / computed_sum
+
+    def get_weight(self, user_id, item_id, reward):
+        norm_val = norm(matmul(self.p[user_id], self.q[item_id]), self.sigma_sq).pdf(reward)
+        # before updating any parameters, resampling is performed based on particle weights
+        return np.sum(norm_val * self.p_expectation(user_id) * self.phi_expectation(item_id))
+
+    def get_theta(self, user_id, item_id, reward, topic):
+        p_exp = self.p_expectation(topic=topic, reward=reward)
+        phi_exp = self.phi_expectation(item_id, reward=reward)
+        return p_exp * phi_exp
+
+    def select_z_topic(self, user_id, item_id, reward):
+        topic = argmax(multinomial(1, [1 / self.n_lat]) * self.n_lat)
+        theta = self.get_theta(user_id, item_id, reward, topic)
+        theta = theta / np.sum(theta)
+        return np.argmax(multinomial(1, theta))
+
+    def update_parameters(self, user_id, item_id, reward, topic):
+        # get user latent preference vector
+        p = np.copy(self.p[user_id])
+
+        # update covariance
+        old_cov = np.copy(self.cov[item_id])
+        new_cov = inv(inv(old_cov) + np.outer(p, p))  # item updated covariance
+
+        # update mean for latent item distribution
+        mu = self.mu_q[item_id]
+        new_mu = matmul(new_cov, (matmul(inv(old_cov), mu) + self.p[user_id] * reward))
+
+        # update inverse gamma hyper-parameters
+        d_old = matmul(matmul(inv(old_cov), mu), mu)
+        d_new = matmul(matmul(inv(new_cov), new_mu), new_mu)
+
+        # perform update
+        self.cov[item_id] = new_cov
+        self.mu_q[item_id, :] = new_mu
+        self.alpha += 0.5
+        self.beta += 0.5 * (d_old + reward ** 2 - d_new)
+        self.lambda_p[topic] += reward
+        self.eta[topic, item_id] += reward
+
+    def sample_random_variables(self, user_id, item_id, topic):
+        # draw variance of the noise for reward prediction
+        self.sigma_sq = invgamma(self.alpha, self.beta).rvs()
+        # draw latent item vector
+        self.q[item_id] = multivariate_normal(self.mu_q[item_id], self.sigma_sq * self.cov[item_id]).rvs()
+        # draw latent user vector
+        self.p[user_id] = dirichlet(self.lambda_p)
+        # draw item mixture corresponding to preference k
+        self.Phi[topic] = dirichlet(self.eta[topic])
+
+
+class ICTR(Particle):
     """
     Sample using interactive collaborative topic regression
+
+    References
+    ----------
+    .. [1] Wang, Qing, et al. "Online interactive collaborative filtering using multi-armed
+       bandit with dependent arms." IEEE Transactions on Knowledge and Data Engineering 31.8 (2018): 1569-1580.
     """
-    def __init__(self, n_users, n_items, B, K, time_buckets, policy='TS'):
+    def __init__(self, n_lat, n_particles, time_buckets, policy='TS'):
         # initialize variables
-        self.B = B
-        self.K = K
+        self.n_items = None
+        self.n_users = None
+        self.n_lat = n_lat
+        self.n_particles = n_particles
         self.policy = policy
         self.time_buckets = time_buckets
-        self.n_items = n_items + 1
-        self.n_users = n_users + 1
 
         # average reward per bucket
         self.rewards_log = [0] * time_buckets
         self.a = [1] * time_buckets  # number of impression per bucket
         self.trace = []  # average reward trace
+        self.arm_trace = []  # trace of arm recommendations
+        self.recommended_arm = 0  # use to print recommended arm
 
-        # initialize hyper-parameters
-        self.lambda_p = ones((self.n_users, self.K, self.B)) * 0.1
-        self.eta = ones((self.K, self.n_items, self.B))*0.1
-        self.mu_q = zeros((self.n_items, self.K, self.B))
-        self.cov = [[identity(self.K)]*self.n_items]*self.B
-        self.alpha = ones((self.n_items, self.B))
-        self.beta = ones((self.n_items, self.B))*0.1
-        self.z = zeros((self.n_users, self.K, self.B))  # preference assignment vector 1-of-K
-        self.x = zeros((self.n_users, self.n_items, self.B))  # item assignment vector 1-of-n
-
-        # initialize latent vectors
-        self.p = zeros((self.n_users, self.K, self.B))
-        self.q = zeros((self.n_items, self.K, self.B))
-
-        # variance over reward prediction
-        self.sigma_sq = ones((self.n_items, self.B))
         # currently selected user arm
-        self.arm = zeros((self.n_users, self.B))
+        # self.arm = zeros((self.n_users, self.n_particles))
+        self.particles = None
 
-    def initialize_particles(self):
+    def get_weights(self, user_id, item_id, reward):
         """
-        Randomly initialize B particles
-        :return:
-        """
-        # for each user
-        for user_idx in range(self.n_users):
-            # draw B particles
-            for i in range(self.B):
-                # sample latent parameters and latent state parameters
-                self.sample(user_idx, i)
-
-    def sample(self, user_idx, i):
-        """
-        Generate samples using the ith particle of user
-        :param user_idx: user index
-        :param i: particle index
-        :return:
-        """
-        # draw latent user vector
-        self.p[user_idx, :, i] = dirichlet(self.lambda_p[user_idx, :, i])
-        # sample latent user preference vector
-        self.z[user_idx, :, i] = multinomial(1, self.p[user_idx, :, i])  # z is 1-of-K vector
-        k = argmax(self.z[user_idx, :, i])  # get corresponding index
-        # draw item mixture corresponding to preference k
-        phi = dirichlet(self.eta[k, :, i])
-        # draw item vector from preference k
-        self.x[user_idx, :, i] = multinomial(1, phi)  # x is 1-of-K vector
-        n = argmax(self.x[user_idx, :, i])  # get corresponding arm
-        # cache arm selection
-        self.arm[user_idx, i] = n
-        # draw variance of the noise for reward prediction
-        self.sigma_sq[n, i] = invgamma(self.alpha[n, i], self.beta[n, i]).rvs()
-        # draw latent item vector
-        self.q[n, :, i] = multivariate_normal(self.mu_q[n, :, i], self.sigma_sq[n, i] * self.cov[i][n]).rvs()
-        # predicted reward
-        # y = normal((self.p[user_idx] * self.q[n]).sum(), self.sigma_sq[n, i])
-
-    def get_weights(self, user_idx, reward):
-        """
-        Compute particle weights for user given reward
-        :param user_idx: index of user currently being served
-        :param reward: observed reward
-        :param n: selected arm
-        :return: normalize particle weights
-        """
-        # compute weights
-        weights = []
-        for i in range(self.B):
-            # get arm
-            n = int(self.arm[user_idx, i])
-            # append ith particles weight
-            weights.append(
-                (multivariate_normal.pdf([reward]*self.K, self.p[user_idx, :, i] * self.q[n, :, i],
-                                         self.sigma_sq[n, i] * identity(self.K)) *
-                 self.lambda_p[user_idx, :, i] / self.lambda_p[user_idx, :, i].sum() *
-                 self.eta[:, n, i] / self.eta[:, n, i].sum()
-                ).sum()
-            )
-        # normalize
-        return np.array(weights) / sum(weights)
-
-    def update(self, user_idx, reward):
-        """
-        Based on observed reward, resample user particles according to likelihood distribution
-        :param user_idx:
+        Get particle weights, proportional to likelihood function
+        :param user_id:
+        :param item_id:
         :param reward:
         :return:
         """
+        weights = []
+        # iterate through particles
+        for particle in self.particles:
+            weights.append(particle.get_weight(user_id, item_id, reward))
+        return weights / np.sum(weights)  # replace with softmax?
+
+    def update(self, user_id, item_id, reward):
+        """
+        Based on observed reward, resample user particles according to likelihood distribution
+        :param user_id:
+        :param reward: observed reward
+        :param item_id: recommended arm
+        :return:
+        """
         # get particle weights
-        weights = self.get_weights(user_idx, reward)
-        # resample particles
-        for i in range(self.B):
-            # get arm
-            n = self.arm[user_idx, i]
-            # sample particle according to weight
-            i = argmax(multinomial(1, weights))
-            # resample
-            self.sample(user_idx, i)
+        weights = self.get_weights(user_id, item_id, reward)
+        # resample particles according to weight
+        ds = choice(range(self.n_particles), p=weights, size=self.n_particles)
+        # update particle list
+        self.particles = [copy.deepcopy(self.particles[i]) for i in ds]
 
         # update statistics for each particle
-        for i in range(self.B):
-            # get arm
-            n = int(self.arm[user_idx, i])
-            # posterior expected latent user vector
-            expected_p = reward * self.z[user_idx, :, i] + self.lambda_p[user_idx, :, i]
-            # posterior expected latent item vector
-            expected_q = reward + self.eta[:, n, i]
-            # posterior multinomial parameter for preference vector
-            theta = expected_p/expected_q.sum() * expected_p/expected_p.sum()
-            # sample posterior latent preference assignment
-            self.z[user_idx, :, i] = multinomial(1, theta)
+        for particle in self.particles:
+            topic = particle.select_z_topic(user_id, item_id, reward)
+            particle.update_parameters(user_id, item_id, reward, topic)
+            particle.sample_random_variables(user_id, item_id, topic)
 
-            # update remaining statistics
-            p = self.p[user_idx, :, i]
-            # update covariance for latent item distribution
-            old_cov = self.cov[i][n]
-            self.cov[i][n] = inv(inv(old_cov) + matmul(p, p.T))
-            # update mean for latent item distribution
-            mu = self.mu_q[n, :, i]
-            mu_new = matmul(old_cov, (matmul(inv(old_cov), mu) + p*reward))
-            self.mu_q[n, :, i] = mu_new
-            # update inverse gamma hyper-parameters
-            self.alpha[n, i] += 0.5
-            self.beta[n, i] += 0.5 * (matmul(matmul(old_cov, mu), mu) + reward**2 - matmul(matmul(old_cov, mu_new), mu_new))
-            # update latent user preference dirichlet hyperparameter
-            self.lambda_p[user_idx, :, i] += reward * self.z[user_idx, :, i]
-            # update latent item mixture hyperparameter
-            k = argmax(self.z[user_idx, :, i])
-            self.eta[k, :, i] += reward * self.x[user_idx, :, i]
-
-            # sample q, sigma_sq, p and Psi
-            self.sample(user_idx, i)
-
-    def eval(self, user_idx, n):
+    def eval(self, user_id, item_id):
         """
         Predicted reward average over all particles
-        :param user_idx: index of currently selected user
-        :param n: item index
+        :param user_id: index of currently selected user
+        :param item_id: item index
         :return: average predicted reward
         """
         reward = []
-        for i in range(self.B):
-            # predict reward
-            r = (self.p[user_idx, :, i] * self.q[n, :, i]).sum()
+        for particle in self.particles:
+            # predict reward for ith particle
+            r = matmul(particle.p[user_id], particle.q[item_id])
             # append reward for particle i to list
             reward.append(r)
         # return average over all particles
         return np.mean(reward)
 
-    def select_arm(self, user_idx):
+    def select_arm(self, user_id):
         """
         Select arm based on predicted reward and policy
-        :param user_idx: index of user currently being served
+        :param user_id: index of user currently being served
         :return:
         """
         reward = []
-        for n in range(self.n_items):
-            # get average predicted reward
-            reward.append(self.eval(user_idx, n))
-
+        for item in range(self.n_items):
+            # get average predicted reward over particles
+            reward.append(self.eval(user_id, item))
         # choose arm according to TS or USB
         if self.policy == 'TS':
             # select arm
@@ -192,11 +196,12 @@ class ICTR:
             # compute variance
             nu = (1/self.B) * (self.sigma_sq**2).sum()
             # select arm
-            return argmax(reward + self.gamma*sqrt(nu))
+            gamma = 1
+            return argmax(reward + gamma*sqrt(nu))
         else:
             raise Exception("Please enter a valid policy: {'TS', 'UCB'}")
 
-    def evaluate_policy(self, user_idx, item_idx, reward, t):
+    def evaluate_policy(self, user_id, item_id, reward, t):
         """
         Replayer method of evaluation
         :param user_idx: user index
@@ -206,23 +211,32 @@ class ICTR:
         :return:
         """
         # select arm
-        n = self.select_arm(user_idx)
-        if n == item_idx:
+        n = self.select_arm(user_id)
+        if n == item_id:
             # update parameter and states
-            self.update(user_idx, reward)
-            # update average reward log
+            self.update(user_id, n, reward)
+            # update average reward log for time bucket t
             self.rewards_log[t] = self.rewards_log[t] + (1 / self.a[t]) * (reward - self.rewards_log[t])
-            # update counter
+            # update impression count for time bucket t
             self.a[t] += 1
-            # append to trace
+            # append trace
             self.trace.append(self.rewards_log[t])
+            self.arm_trace.append(n)
+            # update current arm
+            self.recommended_arm = n
+        else:
+            for particle in self.particles:
+                topic = particle.select_z_topic(user_id, item_id, reward)
+                particle.sample_random_variables(user_id, item_id, topic)
 
-    def get_average_rating(self):
+    def init_particles(self, n_users, n_items):
         """
-        Get average reward and impression log
-        :return: average rating at time t
+        Initialize particles
         """
-        return self.rewards_log, self.a
+        # get particle
+        particle = Particle(n_users, n_items, self.n_lat)
+        # generate deep copies of particle
+        self.particles = [Particle(n_users, n_items, self.n_lat) for _ in range(self.n_particles)]
 
     def replay(self, ratings):
         """
@@ -230,17 +244,42 @@ class ICTR:
         :param ratings: dataset [user_id, item_id, rating and time bucket]
         :return:
         """
+        # get number of users, items
+        self.n_users = ratings.user_id.nunique()  # number of users
+        self.n_items = ratings.item_id.nunique()  # number of items
+
+        # initialize particles
+        print("Initializing particles . . .")
+        self.init_particles(self.n_users, self.n_items)
+        print("Done.")
+
         # run experiment
         i = 0
-        for user_idx, item_idx, rating, t in ratings.to_numpy():
-            self.evaluate_policy(user_idx=int(user_idx), item_idx=int(item_idx), reward=rating, t=int(t))
-            results, impressions = self.get_average_rating()
+        for user_id, item_id, rating, t in ratings.to_numpy():
+            self.evaluate_policy(user_id=int(user_id), item_id=int(item_id), reward=rating, t=int(t))
+            results, impressions = self.get_results()
             print(
                 "Progress", np.round(i / len(ratings), 3),
-                'Time Bucket:', t,
-                "Impressions:", impressions[int(t)],
+                'Time Bucket:', int(t),
+                "Impressions:", impressions[int(t)] - 1,
+                "User ID:", int(user_id),
+                "Selected Arm:", self.recommended_arm,
                 "Average Rating:", results[int(t)])
             i += 1
+
+    def get_results(self):
+        """
+        Get average reward and impression log
+        :return: average rating at time t
+        """
+        return self.rewards_log, self.a
+
+    def get_trace(self):
+        """
+        Return trace
+        :return:
+        """
+        return self.trace, self.arm_trace
 
     if __name__ == '__main__':
         import pandas as pd
@@ -252,14 +291,23 @@ class ICTR:
 
         # get model params from data
         T = ratings.time_bucket.nunique()  # get number of unique time buckets
-        n_users = ratings.user_id.nunique()  # number of users
-        n_items = ratings.item_id.nunique()  # number of items
 
         # initialize model
         from ICTR import ICTR
         B = 10  # number of particles
-        K = 2  # latent parameter dimension
-        model = ICTR(n_users=n_users, n_items=n_items, K=K, B=B, time_buckets=T, policy='TS')
+        K = 3  # latent parameter dimension
+        model = ICTR(n_lat=K, n_particles=B, time_buckets=T, policy='TS')
 
         # run experiment
         model.replay(ratings)
+
+        # get results
+        avg_rating, impressions = model.get_results()
+        reward_trace, arm_trace = model.get_trace()
+
+        # save result,format date
+        pd.DataFrame(np.array([avg_rating, impressions]).T, columns=['rating', 'impressions']) \
+            .to_csv('test_results/ictr_results_{date}.csv'.format(date=date.today()))
+        # save trace
+        pd.DataFrame(np.array(reward_trace, arm_trace), columns=['trace']) \
+            .to_csv('test_results/ictr_trace_{date}.csv'.format(date=date.today()))

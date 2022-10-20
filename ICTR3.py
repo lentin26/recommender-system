@@ -1,4 +1,4 @@
-from numpy import array, zeros, ones, identity, argmax, copy, matmul, outer, arange, delete, unique
+from numpy import array, zeros, ones, identity, argmax, copy, matmul, outer, arange, delete, exp, argwhere
 from numpy.random import choice
 from numpy.linalg import inv
 from scipy.stats import invgamma, multivariate_normal, dirichlet, multinomial
@@ -15,15 +15,18 @@ class ICTR3:
         self.n_lat = n_lat
         self.n_particles = n_particles
 
-        self.eta = [copy(ones((n_lat, n_items))) for _ in range(n_particles)]
-        self.lambda_ = [copy(ones(n_lat)) for _ in range(n_particles)]
+        self.eta = [copy(100 * ones((n_lat, n_items))) for _ in range(n_particles)]
+        self.lambda_ = [copy(100 * ones(n_lat)) for _ in range(n_particles)]
         self.mu = [copy(zeros((n_items, n_lat))) for _ in range(n_particles)]
         self.Sigma = [[copy(identity(n_lat)) for _i in range(n_users)] for _j in range(n_particles)]
         self.Phi = [copy(dirichlet(ones(n_items)).rvs(size=n_lat)) for _ in range(n_particles)]
 
-        self.alpha = 3.
-        self.beta = 0.5
-        self.sigma_2 = [[0.2] * n_items] * n_particles # [invgamma(1., 1.).rvs(size=n_items)] * n_particles
+        self.alpha = [1.] * n_particles
+        self.beta = [1.] * n_particles
+        self.alpha_n = [[1.] * n_items] * n_particles
+        self.beta_n = [[1.] * n_items] * n_particles
+        self.sigma_2 = [[1.] * n_items] * n_particles
+        self.sigma_2 = [copy(invgamma(1., 1.).rvs(size=n_items)) for _ in range(n_particles)]
         self.q = [
                     [
                         copy(multivariate_normal(self.mu[i][j], self.sigma_2[i][j] * self.Sigma[i][j]).rvs())
@@ -32,15 +35,9 @@ class ICTR3:
                     for i in range(n_particles)
                  ]
         self.p = [copy(dirichlet(ones(n_lat)).rvs(size=n_users)) for i in range(n_particles)]
-        # uniformly sample a topic for each user
-        self.z = [argmax(multinomial(1, p=[1/n_lat] * n_lat).rvs(size=n_users), axis=1)] * n_particles
-
-        self.user_topic_assignment = zeros((n_users, n_lat))
-        self.topic_item_assignment = zeros((n_lat, n_items))
-        self.topic_assignment = zeros(n_lat)
 
         # eligible items
-        self.eligible_items = [arange(n_items)] * n_users
+        self.eligible_items = [copy(arange(n_items)) for _ in range(n_users)]
 
         self.rewards_log = [0] * time_buckets  # average reward per bucket
         self.a = [1] * time_buckets  # number of impression per bucket
@@ -54,8 +51,8 @@ class ICTR3:
         for n in self.eligible_items[user_id]:
             r.append(self.eval(user_id, n))
         # choose arm
-        self.recommended_arm = argmax(r)
-        return argmax(r)
+        self.recommended_arm = self.eligible_items[user_id][argmax(r)]
+        return self.recommended_arm
 
     def eval(self, user_id, item_id):
         r = []
@@ -76,7 +73,8 @@ class ICTR3:
             # expected latent ite vector
             phi_expected = self.eta[i][:, n] / sum(self.eta[i][:, n])
             # compute probability density of observed reward vs predicted reward
-            norm_val = multivariate_normal((self.p[i][user_id] * self.q[i][n]).sum()).pdf(reward)
+            norm_val = multivariate_normal(
+                (self.p[i][user_id] * self.q[i][n]).sum(), self.sigma_2[i][n]).pdf(reward)
             weights.append(sum(norm_val * p_expected * phi_expected))
         # normalize
         return array(weights) / sum(weights)
@@ -84,36 +82,35 @@ class ICTR3:
     def resample_particles(self, weights, user_id, n):
         samples = choice(self.n_particles, size=self.n_particles, p=weights)
         for i, j in enumerate(samples):
-            self.z[i][user_id] = self.z[j][user_id]
-            self.eta[i][:, n] = self.eta[j][:, n]
+            self.eta[i][:, n] = copy(self.eta[j][:, n])
             self.lambda_[i] = copy(self.lambda_[j])
             self.mu[i][n] = self.mu[j][n]
             self.Sigma[i][n] = self.Sigma[j][n]
             self.sigma_2[i][n] = self.sigma_2[j][n]
             self.q[i][n] = self.q[j][n]
-            self.p[i][user_id] = self.p[j][n]
-            self.z[i][user_id] = self.z[j][user_id]
+            self.p[i][user_id] = self.p[j][user_id]
+            self.Phi[i][:, n] = self.Phi[j][:, n]
+            self.alpha[i] = self.alpha[j]
+            self.beta[i] = self.beta[j]
+            self.alpha_n[i][n] = self.alpha_n[j][n]
+            self.beta_n[i][n] = self.beta_n[j][n]
 
     def sample_topic(self, i, user_id, n, reward):
-        # get current topic for user in particle i
-        z = int(self.z[i][user_id])
-        # z = argmax(multinomial(1, [1/self.n_lat] * self.n_lat).rvs())
-        # z = argmax(multinomial(1, p=self.p[i][user_id]).rvs())
+        # draw random topic
+        z = argmax(multinomial(1, [1 / self.n_lat] * self.n_lat).rvs())
 
-        # update hyper-parameters
-        self.lambda_[i][z] += reward
-        self.eta[i][z, n] += reward
+        self.lambda_[i][z] += reward  # update
+        self.eta[i][z, n] += reward  # update
 
-        # compute expectations of p and Phi
+        # get expected p_m and Phi_n
         p = self.lambda_[i] / sum(self.lambda_[i])
         phi = self.eta[i][:, n] / sum(self.eta[i][:, n])
 
         # draw latent topic from posterior
         z = argmax(multinomial(1, p * phi).rvs())
-        self.z[i][user_id] = z
         return z
 
-    def update_parameters(self, i, user_id, n, reward):
+    def update_parameters(self, i, user_id, n, z, reward):
         # get user latent preference vector
         p = copy(self.p[i][user_id])
 
@@ -132,18 +129,32 @@ class ICTR3:
         # perform update
         self.Sigma[i][n] = new_cov
         self.mu[i][n] = new_mu
-        self.alpha += 0.5
-        self.beta += 0.5 * (d_old + reward ** 2 - d_new)
+        self.alpha[i] += 0.5
+        self.beta[i] += 0.5 * (d_old + reward ** 2 - d_new)
+        self.alpha_n[i][n] += 0.5
+        self.beta_n[i][n] += 0.5 * (d_old + reward ** 2 - d_new)
 
     def sample_random_variables(self, i, user_id, n, z):
         # draw variance of the noise for reward prediction
-        # self.sigma_2[i][n] = invgamma(self.alpha, 1/self.beta).rvs()
+        # self.sigma_2[i][n] = invgamma(self.alpha_n[i][n], 1/self.beta_n[i][n]).rvs()
         # draw latent item vector
         self.q[i][n] = multivariate_normal(self.mu[i][n], self.sigma_2[i][n] * self.Sigma[i][n]).rvs()
         # draw latent user vector
         self.p[i][user_id] = dirichlet(self.lambda_[i]).rvs()
         # draw item mixture corresponding to preference k
         self.Phi[i][z] = dirichlet(self.eta[i][z]).rvs()
+
+    def sample(self, user_id):
+        """
+        Stochastically sample to encourage replayer exploration
+        :param user_id:
+        :return:
+        """
+        for i in range(self.n_particles):
+            n = choice(range(self.n_items))
+            # self.sigma_2[i][n] = invgamma(self.alpha[i], 1 / self.beta[i]).rvs()
+            self.q[i][n] = multivariate_normal(self.mu[i][n], self.sigma_2[i][n] * self.Sigma[i][n]).rvs()
+            self.p[i][user_id] = dirichlet(self.lambda_[i]).rvs()
 
     def update(self, user_id, n, reward):
         # get particle {m, n(t)} weights
@@ -154,7 +165,7 @@ class ICTR3:
             # sample z from posterior
             z = self.sample_topic(i, user_id, n, reward)
             # update statistics
-            self.update_parameters(i, user_id, n, reward)
+            self.update_parameters(i, user_id, n, z, reward)
             # sample
             self.sample_random_variables(i, user_id, n, z)
 
@@ -179,10 +190,13 @@ class ICTR3:
                 # update impression count for time bucket t
                 self.a[t] += 1
                 # remove item from eligibility
-                self.eligible_items[user_id] = delete(self.eligible_items[user_id], n)
+                n_loc = argwhere(self.eligible_items[user_id] == n)
+                self.eligible_items[user_id] = delete(self.eligible_items[user_id], n_loc)
                 # append trace
                 self.trace.append(self.rewards_log[t])
                 self.arm_trace.append(n)
+            else:
+                self.sample(user_id)
         else:
             self.recommended_arm = None
 
@@ -249,7 +263,7 @@ if __name__ == '__main__':
 
     # save result,format date
     pd.DataFrame(array([avg_rating, impressions]).T, columns=['rating', 'impressions']) \
-        .to_csv('test_results/ictr3_results_{date}.csv'.format(date=date.today()))
+        .to_csv('test_results/ictr32_results_{date}.csv'.format(date=date.today()))
     # save trace
     pd.DataFrame(array([reward_trace, arm_trace]), columns=['trace']) \
-        .to_csv('test_results/ictr3_trace_{date}.csv'.format(date=date.today()))
+        .to_csv('test_results/ictr32_trace_{date}.csv'.format(date=date.today()))

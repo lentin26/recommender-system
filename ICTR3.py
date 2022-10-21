@@ -1,4 +1,4 @@
-from numpy import array, zeros, ones, identity, argmax, copy, matmul, outer, arange, delete, exp, argwhere
+from numpy import array, zeros, ones, identity, argmax, copy, matmul, outer, arange, delete, argwhere
 from numpy.random import choice
 from numpy.linalg import inv
 from scipy.stats import invgamma, multivariate_normal, dirichlet, multinomial
@@ -26,7 +26,7 @@ class ICTR3:
         self.alpha_n = [[1.] * n_items] * n_particles
         self.beta_n = [[1.] * n_items] * n_particles
         self.sigma_2 = [[1.] * n_items] * n_particles
-        self.sigma_2 = [copy(invgamma(1., 1.).rvs(size=n_items)) for _ in range(n_particles)]
+        # self.sigma_2 = [copy(invgamma(1., 1.).rvs(size=n_items)) for _ in range(n_particles)]
         self.q = [
                     [
                         copy(multivariate_normal(self.mu[i][j], self.sigma_2[i][j] * self.Sigma[i][j]).rvs())
@@ -84,30 +84,43 @@ class ICTR3:
         for i, j in enumerate(samples):
             self.eta[i][:, n] = copy(self.eta[j][:, n])
             self.lambda_[i] = copy(self.lambda_[j])
-            self.mu[i][n] = self.mu[j][n]
-            self.Sigma[i][n] = self.Sigma[j][n]
-            self.sigma_2[i][n] = self.sigma_2[j][n]
-            self.q[i][n] = self.q[j][n]
-            self.p[i][user_id] = self.p[j][user_id]
-            self.Phi[i][:, n] = self.Phi[j][:, n]
-            self.alpha[i] = self.alpha[j]
-            self.beta[i] = self.beta[j]
-            self.alpha_n[i][n] = self.alpha_n[j][n]
-            self.beta_n[i][n] = self.beta_n[j][n]
+            self.mu[i][n] = copy(self.mu[j][n])
+            self.Sigma[i][n] = copy(self.Sigma[j][n])
+            # self.sigma_2[i][n] = copy(self.sigma_2[j][n])
+            self.q[i][n] = copy(self.q[j][n])
+            self.p[i][user_id] = copy(self.p[j][user_id])
+            self.Phi[i][:, n] = copy(self.Phi[j][:, n])
+            self.alpha[i] = copy(self.alpha[j])
+            self.beta[i] = copy(self.beta[j])
+            self.alpha_n[i][n] = copy(self.alpha_n[j][n])
+            self.beta_n[i][n] = copy(self.beta_n[j][n])
 
     def sample_topic(self, i, user_id, n, reward):
         # draw random topic
         z = argmax(multinomial(1, [1 / self.n_lat] * self.n_lat).rvs())
 
-        self.lambda_[i][z] += reward  # update
-        self.eta[i][z, n] += reward  # update
+        # copy variables
+        lmbda = copy(self.lambda_[i])
+        eta = copy(self.eta[i])
+
+        # update copies
+        lmbda[z] += reward
+        eta[z, n] += reward
 
         # get expected p_m and Phi_n
-        p = self.lambda_[i] / sum(self.lambda_[i])
-        phi = self.eta[i][:, n] / sum(self.eta[i][:, n])
+        p = lmbda / sum(lmbda)
+        phi = eta[:, n] / sum(eta[:, n])
+
+        # get expected p_m and Phi_n
+        # p = self.lambda_[i] / sum(self.lambda_[i])
+        # phi = self.eta[i][:, n] / sum(self.eta[i][:, n])
 
         # draw latent topic from posterior
         z = argmax(multinomial(1, p * phi).rvs())
+
+        # update parameters
+        self.lambda_[i][z] += reward  # update
+        self.eta[i][z, n] += reward  # update
         return z
 
     def update_parameters(self, i, user_id, n, z, reward):
@@ -136,7 +149,7 @@ class ICTR3:
 
     def sample_random_variables(self, i, user_id, n, z):
         # draw variance of the noise for reward prediction
-        # self.sigma_2[i][n] = invgamma(self.alpha_n[i][n], 1/self.beta_n[i][n]).rvs()
+        # self.sigma_2[i][n] = invgamma(self.alpha[i], 1/self.beta[i]).rvs()
         # draw latent item vector
         self.q[i][n] = multivariate_normal(self.mu[i][n], self.sigma_2[i][n] * self.Sigma[i][n]).rvs()
         # draw latent user vector
@@ -146,7 +159,7 @@ class ICTR3:
 
     def sample(self, user_id):
         """
-        Stochastically sample to encourage replayer exploration
+        Stochastically sample user and item latent vectors to encourage replayer exploration
         :param user_id:
         :return:
         """

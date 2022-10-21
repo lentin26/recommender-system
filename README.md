@@ -1,4 +1,4 @@
-Recommender System
+# Recommender System
 
 Algorithms:
 - ICTR-TS: Interactive Collaborative Topic Regression with Thompson Sampling [1]

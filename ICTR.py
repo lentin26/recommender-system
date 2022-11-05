@@ -1,4 +1,4 @@
-from numpy import array, zeros, ones, identity, argmax, copy, matmul, outer, arange, delete, argwhere
+from numpy import array, zeros, ones, identity, argmax, copy, matmul, outer, arange, delete, argwhere, concatenate
 from numpy.random import choice
 from numpy.linalg import inv
 from scipy.stats import invgamma, multivariate_normal, dirichlet, multinomial
@@ -7,7 +7,7 @@ from scipy.stats import invgamma, multivariate_normal, dirichlet, multinomial
 # https://github.com/TaskeHAMANO/OnlineLDA_ParticleFilter/blob/efe5cc88d100fa6d5c2cfbc03593721548eced83/learn.c
 
 
-class ICTR3:
+class ICTR:
 
     def __init__(self, n_users: int, n_items: int, n_lat: int, n_particles: int, time_buckets):
         self.n_users = n_users
@@ -18,7 +18,7 @@ class ICTR3:
         self.eta = [copy(100 * ones((n_lat, n_items))) for _ in range(n_particles)]
         self.lambda_ = [copy(100 * ones(n_lat)) for _ in range(n_particles)]
         self.mu = [copy(zeros((n_items, n_lat))) for _ in range(n_particles)]
-        self.Sigma = [[copy(identity(n_lat)) for _i in range(n_users)] for _j in range(n_particles)]
+        self.Sigma = [[copy(identity(n_lat)) for _i in range(n_items)] for _j in range(n_particles)]
         self.Phi = [copy(dirichlet(ones(n_items)).rvs(size=n_lat)) for _ in range(n_particles)]
 
         self.alpha = [1.] * n_particles
@@ -36,7 +36,10 @@ class ICTR3:
                  ]
         self.p = [copy(dirichlet(ones(n_lat)).rvs(size=n_users)) for i in range(n_particles)]
 
-        # eligible items
+        # initialize
+        self.user_registry = array([-1]*n_users)
+        self.item_registry = array([-1]*n_items)
+        # track user eligible items
         self.eligible_items = [copy(arange(n_items)) for _ in range(n_users)]
 
         self.rewards_log = [0] * time_buckets  # average reward per bucket
@@ -92,8 +95,8 @@ class ICTR3:
             self.Phi[i][:, n] = copy(self.Phi[j][:, n])
             self.alpha[i] = copy(self.alpha[j])
             self.beta[i] = copy(self.beta[j])
-            self.alpha_n[i][n] = copy(self.alpha_n[j][n])
-            self.beta_n[i][n] = copy(self.beta_n[j][n])
+            # self.alpha_n[i][n] = copy(self.alpha_n[j][n])
+            # self.beta_n[i][n] = copy(self.beta_n[j][n])
 
     def sample_topic(self, i, user_id, n, reward):
         # draw random topic
@@ -191,6 +194,10 @@ class ICTR3:
         :param t: time index
         :return:
         """
+        # convert user system id to location
+        user_id = argmax(self.user_registry == user_id)
+        # convert item system id to location
+        item_id = argmax(self.item_registry == item_id)
         # check if there are any items left to recommend
         if self.eligible_items[user_id].size > 0:
             # if yes, select arm
@@ -212,6 +219,113 @@ class ICTR3:
                 self.sample(user_id)
         else:
             self.recommended_arm = None
+
+    def add_user(self, user_id):
+        """
+        Initialize a single new user. Consider adding batch operation.
+        :return:
+        """
+        # if there's no remaining space for new user initialize additional instances
+        if (self.user_registry == -1).sum() == 0:
+            # expand user registry
+            self.user_registry = concatenate([self.user_registry, array([-1]*self.n_users)])
+            # expand eligible items list
+            self.eligible_items += [copy(arange(self.n_items)) for _ in range(self.n_users)]
+            # expand user latent item vector collection
+            self.p = [
+                concatenate([self.p[i], copy(dirichlet(ones(self.n_lat)).rvs(size=self.n_users))], axis=0) for
+                i in range(self.n_particles)
+            ]
+        # find first available slot
+        idx = argmax(self.user_registry == -1)
+        # assign user to position
+        self.user_registry[idx] = int(user_id)
+
+    def add_item(self, item_id):
+        """
+        Initialize new item
+        :return:
+        """
+        # if there's no remaining space for new user initialize additional instances
+        if (self.item_registry == -1).sum() == 0:
+            # expand user registry
+            self.item_registry = concatenate([self.item_registry, array([-1] * self.n_items)])
+            # expand eligible items list
+            self.eligible_items = [
+                concatenate([self.eligible_items[i], [self.eligible_items[i].max() + 1]]) for
+                i in range(len(self.eligible_items))
+            ]
+            # self.alpha_n = [[1.] * n_items] * n_particles
+            # self.beta_n = [[1.] * n_items] * n_particles
+            for i in range(self.n_particles):
+                self.sigma_2[i] += [1.] * self.n_items
+            # expand user latent item vector collection for each particle
+            self.eta = [
+                concatenate([self.eta[i], copy(100 * ones((self.n_lat, 1)))], axis=1) for
+                i in range(self.n_particles)
+            ]
+            # for each particle add item mean
+            self.mu = [concatenate([self.mu[i], copy(zeros((1, self.n_lat)))]) for i in range(self.n_particles)]
+            # for each particle add item covariance
+            for i in range(self.n_particles):
+                self.Sigma[i].append(copy(identity(self.n_lat)))
+            # for each particle add Phi
+            self.Phi = [
+                concatenate([self.Phi[i], copy(dirichlet(ones(1)).rvs(size=self.n_lat))], axis=1) for
+                i in range(self.n_particles)
+            ]
+            # find first available slot
+            j = argmax(self.item_registry == -1)
+            for i in range(self.n_particles):
+                self.q[i].append(copy(multivariate_normal(self.mu[i][j], self.sigma_2[i][j] * self.Sigma[i][j]).rvs()))
+        else:
+            # find first available slot
+            j = argmax(self.item_registry == -1)
+        # expand user registry
+        self.item_registry[j] = item_id
+
+    def fit(self, ratings):
+        """
+        Fit data sequentially
+        :param ratings: rating data
+        :return:
+        """
+        for user_id, item_id, rating, t in ratings.to_numpy():
+            # check if user is in the model user registry
+            if user_id not in self.user_registry:
+                # if not, add the user
+                self.add_user(user_id)
+            # check if item is in the item registry
+            if item_id not in self.user_registry:
+                # if not, add the item
+                self.add_item(item_id)
+
+            # convert user system id to location
+            user_id = argmax(self.user_registry == user_id)
+            # convert item system id to location
+            item_id = argmax(self.item_registry == item_id)
+            # update priors
+            self.update(user_id=user_id, n=item_id, reward=rating)
+
+    def delete_user(self, user_id):
+        """
+        Users are positionally identified according to the order they were added to the system.
+        """
+        delete(self.user_registry, user_id)
+        # delete all user artifacts  here ...
+        # delete stuff
+        # delete stuff
+        # delete stuff
+
+    def delete_item(self, item_id):
+        """
+        Users are positionally identified according to the order they were added to the system.
+        """
+        delete(self.item_registry, item_id)
+        # delete all item artifacts  here ...
+        # delete stuff
+        # delete stuff
+        # delete stuff
 
     def replay(self, ratings):
         """
@@ -265,7 +379,7 @@ if __name__ == '__main__':
     # initialize model
     B = 10  # number of particles
     K = 3  # latent parameter dimension
-    model = ICTR3(n_users=n_users, n_items=n_items, n_lat=K, n_particles=B, time_buckets=T)
+    model = ICTR(n_users=n_users, n_items=n_items, n_lat=K, n_particles=B, time_buckets=T)
 
     # run experiment
     model.replay(ratings)

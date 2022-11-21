@@ -10,15 +10,15 @@ class ThompsonSampling:
     Thompson Sampling based recommender system with Gaussian conjugate priors
     """
 
-    def __init__(self, n_users, n_items, dim, sigma, time_buckets) -> None:
+    def __init__(self, n_users, n_items, dim, sigma, time_buckets, user_offset=None, item_offset=None) -> None:
         # set latent vector dimension
         self.dim = dim
         # use training to update priors
         self.train_ratings = None
 
         # user-item ratings
-        self.n_users = n_users + 1
-        self.n_items = n_items + 1
+        self.n_users = n_users #+ 1
+        self.n_items = n_items #+ 1
 
         # prior distributions on user (p), item (q) and ratings
         self.sigma = sigma
@@ -46,6 +46,18 @@ class ThompsonSampling:
         else:
             self.Psi = [self.lambda_p * self.I] * self.n_items
             self.v = np.zeros((self.n_items, self.dim))
+
+        # store offsets
+        if user_offset is None:
+            self.user_offset = [0] * n_users
+        else:
+            self.user_offset = user_offset
+            assert len(user_offset) == n_users
+        if item_offset is None:
+            self.item_offset = [0] * n_items
+        else:
+            self.item_offset = item_offset
+            assert len(item_offset) == n_items
 
         # cache
         self.sampled_item_cache = np.zeros((self.n_users, self.dim))
@@ -104,12 +116,16 @@ class ThompsonSampling:
         mu = matmul(b, inv(A).T)
         cov = inv(A) * (self.sigma ** 2)
 
+        # fetch offset
+        theta_p = self.user_offset[user_idx]
+
         # sample latent user, item vector from posterior
         reward = []
         q_samples = []
-        p = multivariate_normal(mu, cov)
+        p = multivariate_normal(mu + theta_p, cov)
         for i in range(self.n_items):
-            q = multivariate_normal(self.v[i], self.Psi[i])
+            theta_q = self.item_offset[i]
+            q = multivariate_normal(self.v[i] + theta_q, self.Psi[i])
             q_samples.append(q)
             reward.append((p * q).sum())
 

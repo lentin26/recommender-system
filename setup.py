@@ -20,5 +20,5 @@ setup(
         "numpy>=1.17.2",
         "scipy>=1.9.3"
     ],
-    packages=find_packages(include=['models', 'models.*'])
+    packages=find_packages(include=['turbo', 'turbo.*'])
 )
